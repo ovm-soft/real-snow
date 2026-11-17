@@ -1,8 +1,14 @@
-name: Release
+name: Build release zip
 
 on:
-  push:
-    tags: ["v*"]
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing release tag to attach the zip to"
+        required: true
+        default: "v1.3.4"
 
 permissions:
   contents: write
@@ -12,17 +18,22 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.release.tag_name || inputs.tag }}
 
       - name: Build extension zip
+        env:
+          TAG: ${{ github.event.release.tag_name || inputs.tag }}
         run: |
-          VERSION="${GITHUB_REF_NAME#v}"
+          VERSION="${TAG#v}"
           mkdir -p build/real_snow
           cp real_snow.py build/real_snow/__init__.py
           sed "s/^version = .*/version = \"$VERSION\"/" blender_manifest.toml > build/real_snow/blender_manifest.toml
           cd build/real_snow
           zip ../real_snow-$VERSION.zip __init__.py blender_manifest.toml
 
-      - name: Create release
+      - name: Attach zip to the release
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "$GITHUB_REF_NAME" build/real_snow-*.zip --generate-notes
+          TAG: ${{ github.event.release.tag_name || inputs.tag }}
+        run: gh release upload "$TAG" build/real_snow-*.zip --clobber
