@@ -1,0 +1,16 @@
+schema_version = "1.0.0"
+
+id = "real_snow"
+version = "1.3.3"
+name = "Real Snow"
+tagline = "Generate snow mesh on top of objects"
+maintainer = "Real Snow port (original author: Marco Pavanello)"
+type = "add-on"
+website = "https://github.com/ovm-soft/real-snow"
+tags = ["Object"]
+
+blender_version_min = "4.2.0"
+
+license = [
+  "SPDX:GPL-3.0-or-later",
+]
