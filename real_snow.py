@@ -81,9 +81,11 @@ class SNOW_OT_Create(Operator):
         input_objects = [obj for obj in context.selected_objects if obj.type == 'MESH']
         if not input_objects:
             self.report({'WARNING'}, "Select at least one mesh object")
+            show_problems(context, [no_mesh_problem()], snow_added=False)
             return {'CANCELLED'}
 
         snow_list = []
+        problems = []
 
         # Start UI progress bar
         length = len(input_objects)
@@ -99,6 +101,19 @@ class SNOW_OT_Create(Operator):
             context.view_layer.objects.active = obj
             object_eval = obj.evaluated_get(context.view_layer.depsgraph)
             mesh_eval = bpy.data.meshes.new_from_object(object_eval)
+            # Read the face selection from the ORIGINAL mesh. The evaluated copy
+            # does not reliably keep the selection in recent Blender versions.
+            # This is only possible when modifiers did not change the face count.
+            selected_idx = None
+            if vertices:
+                polys = obj.data.polygons
+                if len(polys) == len(mesh_eval.polygons):
+                    selected_idx = set(p.index for p in polys if p.select)
+                    if not selected_idx:
+                        problems.append(no_selection_problem(obj.name))
+                        self.report({'WARNING'}, f"No faces are selected on '{obj.name}'. Select faces in Edit Mode first")
+                        bpy.data.meshes.remove(mesh_eval)
+                        continue
             snow_object = bpy.data.objects.new("Snow", mesh_eval)
             snow_object.matrix_world = obj.matrix_world
             context.collection.objects.link(snow_object)
@@ -111,7 +126,18 @@ class SNOW_OT_Create(Operator):
             bm_copy.transform(obj.matrix_world)
             bm_copy.normal_update()
             # Get faces data
-            delete_faces(vertices, bm_copy, snow_object)
+            total, considered, upward, best_nz = delete_faces(vertices, bm_copy, snow_object, selected_idx)
+            if not snow_object.data.polygons:
+                problems.append(no_upward_problem(obj.name, vertices, total, considered, best_nz))
+                self.report({'WARNING'}, (
+                    f"No upward-facing faces to cover on '{obj.name}': "
+                    f"{total} faces, {considered} {'selected' if vertices else 'considered'}, "
+                    f"{upward} pointing up. Highest face normal Z = {best_nz:.2f} "
+                    f"(needs at least {math.sin(0.5):.2f}; negative means flipped normals)"))
+                dead_mesh = snow_object.data
+                bpy.data.objects.remove(snow_object)
+                bpy.data.meshes.remove(dead_mesh)
+                continue
             ballobj = add_metaballs(context, height, snow_object)
             context.view_layer.objects.active = snow_object
             surface_area = area(snow_object)
@@ -140,7 +166,89 @@ class SNOW_OT_Create(Operator):
             s.select_set(True)
         # End progress bar
         context.window_manager.progress_end()
+        if problems:
+            show_problems(context, problems, snow_added=bool(snow_list))
+        if not snow_list:
+            return {'CANCELLED'}
         return {'FINISHED'}
+
+
+# --- User-facing problem messages ----------------------------------------------
+# Each problem is (headline, [lines]). Lines are kept short because Blender
+# popups do not wrap text.
+
+def no_mesh_problem():
+    return ("No mesh object is selected", [
+        "Snow can only be added to mesh objects (not cameras,",
+        "lights, curves, etc.).",
+        "",
+        "To fix it: select a mesh object and click Add Snow again.",
+    ])
+
+
+def no_selection_problem(name: str):
+    return (f"'{name}': no faces are selected", [
+        "'Selected Faces' is ticked, so snow is only added to the",
+        "faces you select.",
+        "",
+        "To fix it:",
+        "  1. Select the object and press Tab (Edit Mode).",
+        "  2. Select the faces that should get snow.",
+        "  3. Press Tab to go back to Object Mode.",
+        "  4. Click Add Snow again.",
+        "Or untick 'Selected Faces' to snow every upward-facing part.",
+    ])
+
+
+def no_upward_problem(name: str, selection_mode: bool, total: int, considered: int, best_nz: float):
+    if selection_mode:
+        headline = f"'{name}': none of the {considered} selected faces point up"
+    else:
+        headline = f"'{name}': no face of this object points up"
+    lines = []
+    if best_nz < -0.1:
+        lines += [
+            "The faces point downward (flipped normals).",
+            "",
+            "To fix it:",
+            "  1. Turn on Overlays > Face Orientation. Red = flipped.",
+            "  2. In Edit Mode choose Mesh > Normals > Recalculate Outside.",
+        ]
+    else:
+        lines += [
+            "The faces are too steep. Snow only lands on faces that",
+            "point within about 60 degrees of straight up.",
+            "",
+            "To fix it:",
+            "  1. Select faces on TOP of the object, not on its walls.",
+            "  2. If the object is rotated, apply it first:",
+            "     Ctrl+A > Rotation (\"up\" is measured in world space).",
+        ]
+    if selection_mode:
+        lines.append("  Or untick 'Selected Faces' to snow all upward faces.")
+    lines += ["", "Then click Add Snow again."]
+    return (headline, lines)
+
+
+def show_problems(context, problems, snow_added: bool):
+    """Show one popup describing every object that could not get snow."""
+    shown = problems[:3]
+    hidden = len(problems) - len(shown)
+
+    def draw(self, _context):
+        layout = self.layout
+        for index, (headline, lines) in enumerate(shown):
+            if index:
+                layout.separator()
+            layout.label(text=headline, icon='ERROR')
+            for line in lines:
+                layout.label(text=line)
+        if hidden > 0:
+            layout.separator()
+            layout.label(text=f"...and {hidden} more object(s), see the Info log.")
+
+    title = "Real Snow: some objects were skipped" if snow_added else "Real Snow: no snow was added"
+    context.window_manager.popup_menu(draw, title=title, icon='ERROR')
 
 
 def _try_set(target, attr: str, value) -> bool:
@@ -216,27 +324,37 @@ def add_metaballs(context, height: float, snow_object: bpy.types.Object) -> bpy.
     return ballobj
 
 
-def delete_faces(vertices, bm_copy, snow_object: bpy.types.Object):
-    # Find upper faces
-    if vertices:
-        selected_faces = set(face.index for face in bm_copy.faces if face.select)
+def delete_faces(vertices, bm_copy, snow_object: bpy.types.Object, selected_idx=None):
+    # Faces are identified by their position in the face list instead of
+    # face.index, which can be stale in edit mode.
+    bm_copy.faces.ensure_lookup_table()
+    # Selected faces: normally supplied from the original object, otherwise
+    # fall back to the selection stored on the copy.
+    if vertices and selected_idx is None:
+        selected_idx = set(i for i, face in enumerate(bm_copy.faces) if face.select)
     # Based on a certain angle, find all faces not pointing up
-    down_faces = set(face.index for face in bm_copy.faces if Vector((0, 0, -1.0)).angle(face.normal, 4.0) < (math.pi / 2.0 + 0.5))
+    down_faces = set(i for i, face in enumerate(bm_copy.faces) if Vector((0, 0, -1.0)).angle(face.normal, 4.0) < (math.pi / 2.0 + 0.5))
+    # Statistics for the warning shown when nothing is left to cover
+    candidates = selected_idx if vertices else set(range(len(bm_copy.faces)))
+    up_count = len([i for i in candidates if i not in down_faces])
+    best_nz = max((bm_copy.faces[i].normal.z for i in candidates), default=0.0)
+    stats = (len(bm_copy.faces), len(candidates), up_count, best_nz)
     bm_copy.free()
     bpy.ops.mesh.select_all(action='DESELECT')
-    # Select upper faces
+    # Select the faces to delete: unselected ones (if requested) and downward ones
     mesh = bmesh.from_edit_mesh(snow_object.data)
-    for face in mesh.faces:
-        if vertices:
-            if face.index not in selected_faces:
-                face.select = True
-        if face.index in down_faces:
+    mesh.faces.ensure_lookup_table()
+    for i, face in enumerate(mesh.faces):
+        if vertices and i not in selected_idx:
+            face.select = True
+        if i in down_faces:
             face.select = True
     # Delete unnecessary faces
     faces_select = [face for face in mesh.faces if face.select]
     bmesh.ops.delete(mesh, geom=faces_select, context='FACES_KEEP_BOUNDARY')
     mesh.free()
     bpy.ops.object.mode_set(mode='OBJECT')
+    return stats
 
 
 def area(obj: bpy.types.Object) -> float:
