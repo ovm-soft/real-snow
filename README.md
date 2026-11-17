@@ -26,8 +26,11 @@ All credit for the add-on itself goes to the original authors.
 Download `real_snow-1.3.6.zip` and in Blender open
 Preferences → Get Extensions → Install from Disk.
 
-Then open the **Real Snow** tab in the 3D Viewport sidebar (N), select mesh
+## Use
+
+Open the **Real Snow** tab in the 3D Viewport sidebar (N), select mesh
 objects and click **Add Snow**.
+Or go to Edit Mode, select top faces, switch back to Object Mode, check Selected Faces and click **Add Snow**
 
 ## License
 
