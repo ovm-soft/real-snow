@@ -56,6 +56,7 @@ class REAL_PT_snow(Panel):
         layout.use_property_decorate = False
         flow = layout.grid_flow(row_major=True, columns=0, even_columns=False, even_rows=False, align=True)
         col = flow.column()
+        col.prop(settings, 'max_angle')
         col.prop(settings, 'vertices')
         row = layout.row(align=True)
         row.scale_y = 1.5
@@ -76,6 +77,7 @@ class SNOW_OT_Create(Operator):
         coverage = context.scene.snow.coverage
         height = context.scene.snow.height
         vertices = context.scene.snow.vertices
+        max_angle = context.scene.snow.max_angle
 
         # Get a list of selected objects, except non-mesh objects
         input_objects = [obj for obj in context.selected_objects if obj.type == 'MESH']
@@ -103,7 +105,7 @@ class SNOW_OT_Create(Operator):
             mesh_eval = bpy.data.meshes.new_from_object(object_eval)
             # Read the face selection from the ORIGINAL mesh. The evaluated copy
             # does not reliably keep the selection in recent Blender versions.
-            # This is only possible when modifiers did not change the face count.
+            # That is only possible when modifiers did not change the face count.
             selected_idx = None
             if vertices:
                 polys = obj.data.polygons
@@ -112,6 +114,23 @@ class SNOW_OT_Create(Operator):
                     if not selected_idx:
                         problems.append(no_selection_problem(obj.name))
                         self.report({'WARNING'}, f"No faces are selected on '{obj.name}'. Select faces in Edit Mode first")
+                        bpy.data.meshes.remove(mesh_eval)
+                        continue
+                else:
+                    # Modifiers changed the face count, so the original selection
+                    # cannot be matched. Look for selection flags that survived on
+                    # the evaluated mesh; if there are none, explain what to do.
+                    selected_idx = set(i for i, p in enumerate(mesh_eval.polygons) if p.select)
+                    if not selected_idx:
+                        try:
+                            selected_idx = set(i for i, p in enumerate(object_eval.data.polygons) if p.select)
+                        except (AttributeError, RuntimeError):
+                            selected_idx = set()
+                    if not selected_idx:
+                        problems.append(modifier_selection_problem(obj.name))
+                        self.report({'WARNING'}, (
+                            f"'{obj.name}' has modifiers that change its face count "
+                            f"({len(polys)} -> {len(mesh_eval.polygons)}); the face selection cannot be used"))
                         bpy.data.meshes.remove(mesh_eval)
                         continue
             snow_object = bpy.data.objects.new("Snow", mesh_eval)
@@ -126,14 +145,14 @@ class SNOW_OT_Create(Operator):
             bm_copy.transform(obj.matrix_world)
             bm_copy.normal_update()
             # Get faces data
-            total, considered, upward, best_nz = delete_faces(vertices, bm_copy, snow_object, selected_idx)
+            total, considered, upward, best_angle = delete_faces(vertices, bm_copy, snow_object, selected_idx, max_angle)
             if not snow_object.data.polygons:
-                problems.append(no_upward_problem(obj.name, vertices, total, considered, best_nz))
+                problems.append(no_upward_problem(obj.name, vertices, considered, best_angle, max_angle))
                 self.report({'WARNING'}, (
-                    f"No upward-facing faces to cover on '{obj.name}': "
+                    f"No faces to cover on '{obj.name}': "
                     f"{total} faces, {considered} {'selected' if vertices else 'considered'}, "
-                    f"{upward} pointing up. Highest face normal Z = {best_nz:.2f} "
-                    f"(needs at least {math.sin(0.5):.2f}; negative means flipped normals)"))
+                    f"{upward} within Max Angle ({math.degrees(max_angle):.0f} deg). "
+                    f"Closest face is {math.degrees(best_angle):.0f} deg from straight up"))
                 dead_mesh = snow_object.data
                 bpy.data.objects.remove(snow_object)
                 bpy.data.meshes.remove(dead_mesh)
@@ -200,32 +219,52 @@ def no_selection_problem(name: str):
     ])
 
 
-def no_upward_problem(name: str, selection_mode: bool, total: int, considered: int, best_nz: float):
+def modifier_selection_problem(name: str):
+    return (f"'{name}': the face selection can't be used", [
+        "This object has modifiers that change its faces (Solidify,",
+        "Bevel, Mirror, Array...), so your selected faces cannot be",
+        "matched to the final shape. (This also appears when no",
+        "faces are selected.)",
+        "",
+        "To fix it, either:",
+        "  1. Apply the modifiers (Object > Apply > Visual Geometry",
+        "     to Mesh; duplicate the object first to keep a backup),",
+        "     select the faces again and click Add Snow.",
+        "  2. Untick 'Selected Faces' and use Max Angle in the Snow",
+        "     panel to choose which surfaces get snow.",
+    ])
+
+
+def no_upward_problem(name: str, selection_mode: bool, considered: int, best_angle: float, max_angle: float):
+    best_deg = math.degrees(best_angle)
+    max_deg = math.degrees(max_angle)
+    needed = min(180, math.ceil(best_deg))
     if selection_mode:
-        headline = f"'{name}': none of the {considered} selected faces point up"
+        headline = f"'{name}': none of the {considered} selected faces can get snow"
     else:
-        headline = f"'{name}': no face of this object points up"
+        headline = f"'{name}': no face of this object can get snow"
     lines = []
-    if best_nz < -0.1:
+    if best_deg > 100:
         lines += [
-            "The faces point downward (flipped normals).",
+            "The faces point downward (flipped normals?).",
             "",
-            "To fix it:",
-            "  1. Turn on Overlays > Face Orientation. Red = flipped.",
-            "  2. In Edit Mode choose Mesh > Normals > Recalculate Outside.",
+            "To fix it, either:",
+            "  1. Turn on Overlays > Face Orientation (red = flipped),",
+            "     then in Edit Mode: Mesh > Normals > Recalculate Outside.",
+            f"  2. Raise Max Angle in the Snow panel to {needed} degrees",
+            "     (snow under surfaces looks unnatural).",
         ]
     else:
         lines += [
-            "The faces are too steep. Snow only lands on faces that",
-            "point within about 60 degrees of straight up.",
+            f"Snow only lands on faces within Max Angle ({max_deg:.0f} deg) of",
+            f"straight up. The closest face is {best_deg:.0f} deg from up.",
             "",
-            "To fix it:",
-            "  1. Select faces on TOP of the object, not on its walls.",
-            "  2. If the object is rotated, apply it first:",
-            "     Ctrl+A > Rotation (\"up\" is measured in world space).",
+            "To fix it, either:",
+            f"  1. Raise Max Angle in the Snow panel to {needed} degrees or more.",
+            "  2. Select faces closer to the top of the object.",
+            "  3. If the object is rotated, apply it: Ctrl+A > Rotation",
+            "     (\"up\" is measured in world space).",
         ]
-    if selection_mode:
-        lines.append("  Or untick 'Selected Faces' to snow all upward faces.")
     lines += ["", "Then click Add Snow again."]
     return (headline, lines)
 
@@ -324,7 +363,7 @@ def add_metaballs(context, height: float, snow_object: bpy.types.Object) -> bpy.
     return ballobj
 
 
-def delete_faces(vertices, bm_copy, snow_object: bpy.types.Object, selected_idx=None):
+def delete_faces(vertices, bm_copy, snow_object: bpy.types.Object, selected_idx=None, max_angle=math.pi / 2.0 - 0.5):
     # Faces are identified by their position in the face list instead of
     # face.index, which can be stale in edit mode.
     bm_copy.faces.ensure_lookup_table()
@@ -332,13 +371,15 @@ def delete_faces(vertices, bm_copy, snow_object: bpy.types.Object, selected_idx=
     # fall back to the selection stored on the copy.
     if vertices and selected_idx is None:
         selected_idx = set(i for i, face in enumerate(bm_copy.faces) if face.select)
-    # Based on a certain angle, find all faces not pointing up
-    down_faces = set(i for i, face in enumerate(bm_copy.faces) if Vector((0, 0, -1.0)).angle(face.normal, 4.0) < (math.pi / 2.0 + 0.5))
+    # Faces tilted more than max_angle away from straight up get no snow
+    # (the original behaviour corresponds to max_angle = pi / 2 - 0.5, about 61 degrees)
+    down_faces = set(i for i, face in enumerate(bm_copy.faces) if Vector((0, 0, 1.0)).angle(face.normal, 4.0) > max_angle)
     # Statistics for the warning shown when nothing is left to cover
     candidates = selected_idx if vertices else set(range(len(bm_copy.faces)))
     up_count = len([i for i in candidates if i not in down_faces])
-    best_nz = max((bm_copy.faces[i].normal.z for i in candidates), default=0.0)
-    stats = (len(bm_copy.faces), len(candidates), up_count, best_nz)
+    # Angle between straight up and the face closest to it (used in the warning)
+    best_angle = min((Vector((0, 0, 1.0)).angle(bm_copy.faces[i].normal, math.pi / 2.0) for i in candidates), default=math.pi / 2.0)
+    stats = (len(bm_copy.faces), len(candidates), up_count, best_angle)
     bm_copy.free()
     bpy.ops.mesh.select_all(action='DESELECT')
     # Select the faces to delete: unselected ones (if requested) and downward ones
@@ -553,6 +594,15 @@ class SnowSettings(PropertyGroup):
         precision=2,
         min=0.1,
         max=1
+    )
+    max_angle: FloatProperty(
+        name="Max Angle",
+        description="Largest angle between a face and straight up that still gets snow. "
+                    "Low values cover only flat tops; high values also cover steep slopes and walls",
+        default=math.pi / 2.0 - 0.5,
+        min=0.0,
+        max=math.pi,
+        subtype='ANGLE'
     )
     vertices: BoolProperty(
         name="Selected Faces",
